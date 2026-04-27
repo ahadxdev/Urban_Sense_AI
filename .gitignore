@@ -12,3 +12,5 @@ __pycache__/
 *.h5
 *.pt
 models/
+config.bat
+node_modules

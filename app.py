@@ -1,8 +1,11 @@
-from fastapi import FastAPI
+import utils.transport
+import utils.session
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import joblib, os, requests, pandas as pd, warnings
 from datetime import datetime
+from uuid import uuid4
 warnings.filterwarnings('ignore')
 
 app = FastAPI()
@@ -74,6 +77,71 @@ def get_risk(prob):
     elif prob < 0.7: return "#f97316", "Risky"
     else:            return "#f87171", "Dangerous"
 
+class RoutePoint(BaseModel):
+    node_id: int
+    lat: float
+    lng: float
+
+class RouteCreateRequest(BaseModel):
+    start_node: int
+    end_node: int
+    distance_meters: float
+    path: list[RoutePoint]
+
+class RoutePredictRequest(BaseModel):
+    state: str = ""
+    weather_api_key: str = ""
+    
+    class Config:
+        extra = "ignore"
+
+route_store: dict[str, dict] = {}
+
+def _predict_route_from_points(points: list[RoutePoint], state: str, api_key: str):
+    state_key = state.lower() if state else next(iter(models.keys()), "")
+    if state_key not in models:
+        raise HTTPException(status_code=400, detail=f"Unknown state model: {state}")
+
+    api_key = api_key or os.getenv("WEATHER_API_KEY", "")
+    if not points:
+        return {"segments": [], "state": state_key}
+
+    mid = points[len(points) // 2]
+    weather = get_weather(mid.lat, mid.lng, api_key)
+    now = datetime.now()
+    time_feats = {
+        "hour": now.hour,
+        "day": now.day,
+        "month": now.month,
+        "is_rush_hour": 1 if now.hour in [7, 8, 9, 16, 17, 18] else 0,
+        "is_weekend": 1 if now.weekday() >= 5 else 0,
+        "is_winter": 1 if now.month in [12, 1, 2] else 0,
+        "Sunrise_Sunset": "Day" if 6 <= now.hour <= 18 else "Night"
+    }
+
+    results = []
+    for point in points:
+        nf = get_node_feats(point.node_id)
+        features = {
+            "Start_Lat": point.lat,
+            "Start_Lng": point.lng,
+            **weather,
+            **nf,
+            **time_feats
+        }
+        prob = predict_probability(state_key, features)
+        color, risk = get_risk(prob)
+        results.append({
+            "node_id": point.node_id,
+            "lat": point.lat,
+            "lng": point.lng,
+            # "probability": round(prob, 3),
+            "risk": risk
+            # "risk_color": color
+        })
+
+    return {"segments": results, "state": state_key}
+
 class BatchRequest(BaseModel):
     points: list
     state: str
@@ -82,6 +150,44 @@ class BatchRequest(BaseModel):
 @app.get("/")
 def root():
     return {"status": "Urban Sense AI running", "models": list(models.keys())}
+
+@app.post("/routes", status_code=201)
+def create_route(route: RouteCreateRequest):
+    route_id = str(uuid4())
+    route_store[route_id] = {
+        "id": route_id,
+        "start_node": route.start_node,
+        "end_node": route.end_node,
+        "distance_meters": route.distance_meters,
+        "path": [point.dict() for point in route.path],
+        "created_at": datetime.utcnow().isoformat() + "Z"
+    }
+    return {"route_id": route_id}
+
+@app.get("/routes/{route_id}")
+def get_route(route_id: str):
+    route = route_store.get(route_id)
+    if not route:
+        raise HTTPException(status_code=404, detail="Route not found")
+    return route
+
+@app.post("/routes/{route_id}/predict")
+def predict_route_by_id(route_id: str, payload: RoutePredictRequest = None):
+    route = route_store.get(route_id)
+    if not route:
+        raise HTTPException(status_code=404, detail="Route not found")
+    points = [RoutePoint(**point) for point in route["path"]]
+    state = payload.state if payload and payload.state else ""
+    weather_api_key = payload.weather_api_key if payload and payload.weather_api_key else ""
+    return _predict_route_from_points(points, state, weather_api_key)
+
+@app.get("/routes/{route_id}/predict")
+def get_route_predictions(route_id: str):
+    route = route_store.get(route_id)
+    if not route:
+        raise HTTPException(status_code=404, detail="Route not found")
+    points = [RoutePoint(**point) for point in route["path"]]
+    return _predict_route_from_points(points, "", "")
 
 @app.post("/predict-route")
 def predict_route(req: BatchRequest):
@@ -109,8 +215,6 @@ def predict_route(req: BatchRequest):
             "node_id":     point.get("node_id"),
             "lat":         point["lat"],
             "lng":         point["lng"],
-            "probability": round(prob, 3),
-            "color":       color,
-            "risk":        risk,
+            "probability": round(prob, 3)
         })
     return {"segments": results, "state": req.state}
