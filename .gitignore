@@ -1,0 +1,14 @@
+mlenv/
+venv/
+__pycache__/
+*.pyc
+
+# data
+*.csv
+
+# models
+*.pkl
+*.joblib
+*.h5
+*.pt
+models/
